@@ -32,7 +32,7 @@ def get_short(url, client):
         short_api = getattr(client, 'short_api', SHORT_API)
         
         api_url = f"https://{short_url}/api?api={short_api}&url={url}&alias={alias}"
-        response = requests.get(api_url)
+        response = requests.get(api_url, timeout=8)
         rjson = response.json()
 
         if rjson.get("status") == "success" and response.status_code == 200:
@@ -256,5 +256,6 @@ async def test_shortner(client: Client, query: CallbackQuery):
         msg = f"**❌ ꜱʜᴏʀᴛɴᴇʀ ᴛᴇꜱᴛ ꜰᴀɪʟᴇᴅ!**\n\n**ᴇʀʀᴏʀ:** `{str(e)}`"
     
     await query.message.edit_text(msg, reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton('◂ ʙᴀᴄᴋ', 'shortner')]]))
+
 
 
