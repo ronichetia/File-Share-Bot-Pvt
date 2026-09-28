@@ -17,6 +17,17 @@ class MongoDB:
             cls._instances[(uri, db_name)] = instance
         return cls._instances[(uri, db_name)]
 
+    async def create_indexes(self):
+        """Lookups by (user_id, channel_id) were full collection scans."""
+        try:
+            await self.fsub_status.create_index([("user_id", 1), ("channel_id", 1)])
+            await self.request_sub.create_index([("user_id", 1), ("channel_id", 1)])
+        except Exception as e:
+            print(f"Index creation failed: {e}")
+
+    async def get_user(self, user_id: int):
+        return await self.user_data.find_one({'_id': user_id})
+
     async def set_channels(self, channels: list[int]):
         await self.user_data.update_one(
             {"_id": 1},
