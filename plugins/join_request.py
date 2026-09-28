@@ -39,6 +39,7 @@ async def handle_member_update(client, chat_member_updated: ChatMemberUpdated):
     if channel_id not in client.fsub_dict:
         return
     
+    client.sub_cache.pop(user_id, None)
     old_status = chat_member_updated.old_chat_member.status if chat_member_updated.old_chat_member else None
     new_status = chat_member_updated.new_chat_member.status if chat_member_updated.new_chat_member else None
     
@@ -88,4 +89,5 @@ async def handle_member_update(client, chat_member_updated: ChatMemberUpdated):
         client.LOGGER(__name__, client.name).error(f"Member update error: {user_id} in {channel_id}: {e}")
 
 
-        
+
+    
