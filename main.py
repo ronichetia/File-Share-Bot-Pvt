@@ -1,4 +1,8 @@
-
+try:
+    import uvloop
+    uvloop.install()
+except ImportError:
+    pass
 import asyncio
 from bot import Bot, web_app
 from pyrogram import compose
