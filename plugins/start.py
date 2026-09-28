@@ -14,20 +14,22 @@ import asyncio
 async def start_command(client: Client, message: Message):
     user_id = message.from_user.id
 
-    # 1. Add user if not present
-    present = await client.mongodb.present_user(user_id)
-    if not present:
+    text = message.text
+    has_payload = len(text) > 7
+
+    # 1+2+3. ONE parallel round-trip: user doc (exists / banned) + premium status
+    user_doc, is_user_pro = await asyncio.gather(
+        client.mongodb.get_user(user_id),
+        client.mongodb.is_pro(user_id) if has_payload else asyncio.sleep(0, False),
+    )
+    if user_doc is None:
         try:
             await client.mongodb.add_user(user_id)
         except Exception as e:
             client.LOGGER(__name__, client.name).warning(f"Error adding a user:\n{e}")
-
-    # 2. Check if banned
-    is_banned = await client.mongodb.is_banned(user_id)
-    if is_banned:
+    elif user_doc.get('ban', False):
         return await message.reply("**You have been banned from using this bot!**")
 
-    text = message.text
     if len(text) > 7:
         try:
             original_payload = text.split(" ", 1)[1]
@@ -41,8 +43,7 @@ async def start_command(client: Client, message: Message):
         except IndexError:
             return await message.reply("Invalid command format.")
 
-        # 3. Check premium status
-        is_user_pro = await client.mongodb.is_pro(user_id)
+        # (premium status already fetched above)
         
         # 4. Check if shortner is enabled
         shortner_enabled = getattr(client, 'shortner_enabled', True)
@@ -50,7 +51,7 @@ async def start_command(client: Client, message: Message):
         # 5. If user is not premium AND shortner is enabled, send short URL and return
         if not is_user_pro and user_id != OWNER_ID and not is_short_link and shortner_enabled:
             try:
-                short_link = get_short(f"https://t.me/{client.username}?start=yu3elk{base64_string}7", client)
+                short_link = await asyncio.to_thread(get_short, f"https://t.me/{client.username}?start=yu3elk{base64_string}7", client)
             except Exception as e:
                 client.LOGGER(__name__, client.name).warning(f"Shortener failed: {e}")
                 return await message.reply("Couldn't generate short link.")
@@ -161,7 +162,6 @@ async def start_command(client: Client, message: Message):
             return await message.reply("⚠️ Invalid or expired link.")
 
         # 7. Get messages from the specific source channel first
-        temp_msg = await message.reply("Wait A Sec..")
         messages = []
 
         try:
@@ -196,13 +196,12 @@ async def start_command(client: Client, message: Message):
                 # Use the multi-channel fallback system
                 messages = await get_messages(client, ids)
         except Exception as e:
-            await temp_msg.edit_text("Something went wrong!")
+            await message.reply("Something went wrong!")
             client.LOGGER(__name__, client.name).warning(f"Error getting messages: {e}")
             return
 
         if not messages:
-            return await temp_msg.edit("Couldn't find the files in the database.")
-        await temp_msg.delete()
+            return await message.reply("Couldn't find the files in the database.")
 
         yugen_msgs = []
         for msg in messages:
@@ -223,7 +222,7 @@ async def start_command(client: Client, message: Message):
                 )
                 yugen_msgs.append(copied_msg)
             except FloodWait as e:
-                await asyncio.sleep(e.x)
+                await asyncio.sleep(e.value)
                 copied_msg = await msg.copy(
                     chat_id=message.from_user.id,
                     caption=caption,
