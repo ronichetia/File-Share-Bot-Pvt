@@ -14,7 +14,7 @@ async def channel_post(client: Client, message: Message):
     try:
         post_message = await message.copy(chat_id = client.db, disable_notification=True)
     except FloodWait as e:
-        await asyncio.sleep(e.x)
+        await asyncio.sleep(e.value)
         post_message = await message.copy(chat_id = client.db, disable_notification=True)
     except Exception as e:
         print(e)
@@ -52,6 +52,7 @@ async def new_post(client: Client, message: Message):
         print(e)
 
         pass
+
 
 
 
