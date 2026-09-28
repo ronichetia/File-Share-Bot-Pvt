@@ -1,6 +1,7 @@
 import base64
 import re
 import asyncio
+import time
 from pyrogram import filters, Client
 from pyrogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton
 from pyrogram.enums import ChatMemberStatus
@@ -32,6 +33,7 @@ async def get_messages(client, message_ids):
     total_messages = 0
     while total_messages != len(message_ids):
         temb_ids = message_ids[total_messages:total_messages+200]
+        msgs = []
         try:
             # Use new multi-DB channel function
             msgs = await get_messages_from_db_channels(client, temb_ids)
@@ -203,88 +205,86 @@ async def is_bot_admin(client, channel_id):
 
 #===============================================================#
 
+ACTIVE_STATUSES = {ChatMemberStatus.MEMBER, ChatMemberStatus.ADMINISTRATOR, ChatMemberStatus.OWNER}
+SUB_CACHE_TTL = 300  # seconds a passed force-sub check is trusted
+
+
+def _bg(coro):
+    """Run a DB write in the background so the user never waits for it."""
+    task = asyncio.create_task(coro)
+    task.add_done_callback(lambda t: (not t.cancelled()) and t.exception())
+    return task
+
+
+async def _mark_joined(client, user_id, channel_id, request):
+    try:
+        await asyncio.gather(
+            client.mongodb.update_fsub_status(user_id, channel_id, "joined"),
+            client.mongodb.add_channel_user(channel_id, user_id),
+        )
+        if request and await client.mongodb.has_submitted_join_request(user_id, channel_id):
+            await client.mongodb.update_join_request_status(user_id, channel_id, "approved")
+    except Exception as e:
+        client.LOGGER(__name__, client.name).warning(f"mark_joined failed: {e}")
+
+
+async def _check_one(client, user_id, channel_id, channel_name, request):
+    """Membership check for ONE channel. Same rules as before, returns the status."""
+    try:
+        user = await client.get_chat_member(channel_id, user_id)
+        if user.status in ACTIVE_STATUSES:
+            _bg(_mark_joined(client, user_id, channel_id, request))
+            return user.status
+
+        if request:
+            if await client.mongodb.has_submitted_join_request(user_id, channel_id):
+                request_status = await client.mongodb.get_join_request_status(user_id, channel_id)
+                if request_status == "approved":
+                    _bg(client.mongodb.update_fsub_status(user_id, channel_id, "left"))
+                    await client.mongodb.remove_join_request(user_id, channel_id)
+                    return ChatMemberStatus.BANNED
+                _bg(client.mongodb.update_fsub_status(user_id, channel_id, "request_submitted"))
+                return ChatMemberStatus.MEMBER  # request pending = allowed
+            _bg(client.mongodb.update_fsub_status(user_id, channel_id, "not_requested"))
+            return ChatMemberStatus.BANNED
+
+        _bg(client.mongodb.update_fsub_status(user_id, channel_id, "left"))
+        _bg(client.mongodb.remove_channel_user(channel_id, user_id))
+        return ChatMemberStatus.BANNED
+
+    except UserNotParticipant:
+        _bg(client.mongodb.remove_channel_user(channel_id, user_id))
+        if request:
+            if await client.mongodb.has_submitted_join_request(user_id, channel_id):
+                _bg(client.mongodb.update_fsub_status(user_id, channel_id, "request_submitted"))
+                return ChatMemberStatus.MEMBER
+            _bg(client.mongodb.update_fsub_status(user_id, channel_id, "not_requested"))
+            return ChatMemberStatus.BANNED
+        _bg(client.mongodb.update_fsub_status(user_id, channel_id, "left"))
+        return ChatMemberStatus.BANNED
+    except Forbidden:
+        client.LOGGER(__name__, client.name).warning(f"Bot lacks permission for {channel_name}.")
+        return None
+    except Exception as e:
+        client.LOGGER(__name__, client.name).warning(f"Error checking {channel_name}: {e}")
+        return None
+
+
 async def check_subscription(client, user_id):
-    """Enhanced subscription check with better request channel handling."""
-    statuses = {}
-
-    # Ensure user exists in database
-    if not await client.mongodb.present_user(user_id):
-        await client.mongodb.add_user(user_id)
-
-    for channel_id, (channel_name, channel_link, request, timer) in client.fsub_dict.items():
+    """Checks ALL force-sub channels in parallel (was one-by-one with many DB writes)."""
+    async def ensure_user():
         try:
-            # Get actual membership status first
-            user = await client.get_chat_member(channel_id, user_id)
-            actual_status = user.status
-            
-            # If user is already a member, admin, or owner
-            if actual_status in {ChatMemberStatus.MEMBER, ChatMemberStatus.ADMINISTRATOR, ChatMemberStatus.OWNER}:
-                await client.mongodb.update_fsub_status(user_id, channel_id, "joined")
-                await client.mongodb.add_channel_user(channel_id, user_id)
-                
-                # If there was a pending join request, mark it as approved
-                if request and await client.mongodb.has_submitted_join_request(user_id, channel_id):
-                    await client.mongodb.update_join_request_status(user_id, channel_id, "approved")
-                
-                statuses[channel_id] = actual_status
-                continue
-            
-            # User is not a member - check if they left after being approved  
-            if request:
-                # For request channels, check if user has submitted a request
-                has_request = await client.mongodb.has_submitted_join_request(user_id, channel_id)
-                if has_request:
-                    # User has submitted request but not yet a member
-                    request_status = await client.mongodb.get_join_request_status(user_id, channel_id)
-                    
-                    if request_status == "approved":
-                        # Request was approved but user still not in channel
-                        # This means user might have left after approval - force them to rejoin
-                        await client.mongodb.update_fsub_status(user_id, channel_id, "left")
-                        await client.mongodb.remove_join_request(user_id, channel_id)
-                        statuses[channel_id] = ChatMemberStatus.BANNED
-                    else:
-                        # Request is still pending, allow user to proceed
-                        await client.mongodb.update_fsub_status(user_id, channel_id, "request_submitted")
-                        statuses[channel_id] = ChatMemberStatus.MEMBER  # Treat as subscribed for request channels
-                else:
-                    # No request submitted yet for request channel
-                    await client.mongodb.update_fsub_status(user_id, channel_id, "not_requested")
-                    statuses[channel_id] = ChatMemberStatus.BANNED
-            else:
-                # Regular channel (not request), user must be a member
-                await client.mongodb.update_fsub_status(user_id, channel_id, "left")
-                await client.mongodb.remove_channel_user(channel_id, user_id)
-                statuses[channel_id] = ChatMemberStatus.BANNED
-                
-        except UserNotParticipant:
-            # User is not in the channel
-            await client.mongodb.update_fsub_status(user_id, channel_id, "left")
-            await client.mongodb.remove_channel_user(channel_id, user_id)
-            
-            if request:
-                # For request channels, check if user has submitted a request
-                has_request = await client.mongodb.has_submitted_join_request(user_id, channel_id)
-                if has_request:
-                    # User has submitted request but not in channel - still allow access for request channels
-                    await client.mongodb.update_fsub_status(user_id, channel_id, "request_submitted")
-                    statuses[channel_id] = ChatMemberStatus.MEMBER  # Treat as subscribed for request channels
-                else:
-                    # No request submitted yet
-                    await client.mongodb.update_fsub_status(user_id, channel_id, "not_requested")
-                    statuses[channel_id] = ChatMemberStatus.BANNED
-            else:
-                # Regular channel, user must join
-                statuses[channel_id] = ChatMemberStatus.BANNED
-                
-        except Forbidden:
-            client.LOGGER(__name__, client.name).warning(f"Bot lacks permission for {channel_name}.")
-            statuses[channel_id] = None
-        except Exception as e:
-            client.LOGGER(__name__, client.name).warning(f"Error checking {channel_name}: {e}")
-            statuses[channel_id] = None
+            if not await client.mongodb.present_user(user_id):
+                await client.mongodb.add_user(user_id)
+        except Exception:
+            pass  # duplicate insert from a parallel request is harmless
 
-    return statuses
+    items = list(client.fsub_dict.items())
+    results = await asyncio.gather(
+        ensure_user(),
+        *[_check_one(client, user_id, cid, name, request) for cid, (name, link, request, timer) in items],
+    )
+    return {cid: status for (cid, _), status in zip(items, results[1:])}
 
 #===============================================================#
 
@@ -302,96 +302,85 @@ def force_sub(func):
     async def wrapper(client: Client, message: Message):
         if not client.fsub_dict:
             return await func(client, message)
-        photo = client.messages.get('FSUB_PHOTO', '')
-        if photo:
-            msg = await message.reply_photo(
-                caption="<b>ᴡᴀɪᴛ ᴀ sᴇᴄᴏɴᴅ.....</b>", 
-                photo=photo
-            )
-        else:
-            msg = await message.reply(
-                "<code><b>ᴡᴀɪᴛ ᴀ sᴇᴄᴏɴᴅ.....</b></code>"
-            )
+
         user_id = message.from_user.id
+        cache = client.sub_cache
+        now = time.monotonic()
+
+        # FAST PATH: user passed the check recently -> no Telegram/DB calls at all
+        ts = cache.get(user_id)
+        if ts is not None and now - ts < SUB_CACHE_TTL:
+            return await func(client, message)
+
         statuses = await check_subscription(client, user_id)
 
         if is_user_subscribed(statuses):
-            await msg.delete()
+            if len(cache) > 50000:
+                cache.clear()
+            cache[user_id] = now
             return await func(client, message)
 
-        # User is not subscribed to all channels
-        buttons = []
-        channels_message = f"{client.messages.get('FSUB', 'You must join our channels to use this bot:')}\n\n"
+        cache.pop(user_id, None)
 
-        for channel_id, (channel_name, channel_link, request, timer) in client.fsub_dict.items():
+        # Not subscribed: build join buttons (invite links created in parallel)
+        async def make_button(channel_id, channel_name, channel_link, request, timer):
             status = statuses.get(channel_id, None)
-
-            # Generate invite link if needed
+            if status in ACTIVE_STATUSES:
+                return None
+            if request and await client.mongodb.has_submitted_join_request(user_id, channel_id):
+                if await client.mongodb.get_join_request_status(user_id, channel_id) == "pending":
+                    return None
             if timer > 0:
-                expire_time = datetime.now() + timedelta(minutes=timer)
                 try:
                     invite = await client.create_chat_invite_link(
                         chat_id=channel_id,
-                        expire_date=expire_time,
+                        expire_date=datetime.now() + timedelta(minutes=timer),
                         creates_join_request=request
                     )
                     channel_link = invite.invite_link
                 except Exception as e:
                     client.LOGGER(__name__, client.name).warning(f"Error creating invite link for {channel_name}: {e}")
+            if channel_link and str(channel_link).startswith(('http://', 'https://')):
+                return InlineKeyboardButton(f"Join {channel_name}", url=channel_link)
+            return None
 
-            # Add button based on user status
-            if status not in {ChatMemberStatus.MEMBER, ChatMemberStatus.ADMINISTRATOR, ChatMemberStatus.OWNER}:
-                if request and await client.mongodb.has_submitted_join_request(user_id, channel_id):
-                    request_status = await client.mongodb.get_join_request_status(user_id, channel_id)
-                    if request_status == "pending":
-                        continue
-                
-                # BUG FIX 1: Ensure channel_link is valid before adding to button
-                if channel_link and str(channel_link).startswith(('http://', 'https://')):
-                    buttons.append(InlineKeyboardButton(f"Join {channel_name}", url=channel_link))
+        made = await asyncio.gather(*[
+            make_button(cid, name, link, request, timer)
+            for cid, (name, link, request, timer) in client.fsub_dict.items()
+        ])
+        buttons = [b for b in made if b]
 
-        # =======================================================
-        # NEW UPDATE: DYNAMIC BOT BUTTONS FROM DATABASE (WITH URL FAIL-SAFE)
-        # =======================================================
         try:
             bots = await client.mongodb.get_fsub_bots()
             if bots:
                 for bot_username, bot_link in bots.items():
-                    # BUG FIX 2: Check and fix formatting of the bot_link to avoid BUTTON_URL_INVALID
                     if bot_link and str(bot_link).startswith(('http://', 'https://')):
                         valid_bot_url = bot_link
                     else:
-                        clean_username = bot_username.replace("@", "")
-                        valid_bot_url = f"https://t.me/{clean_username}"
-                        
+                        valid_bot_url = f"https://t.me/{bot_username.replace('@', '')}"
                     buttons.append(InlineKeyboardButton(f"🎁 Start @{bot_username}", url=valid_bot_url))
         except Exception as e:
             client.LOGGER(__name__, client.name).warning(f"Error fetching fsub bots: {e}")
-        # =======================================================
 
-        # Add "Try Again" button if needed
         from_link = message.text.split(" ")
         if len(from_link) > 1:
-            # BUG FIX 3: Removed extra slash after client.username to ensure valid URL
-            try_again_link = f"https://t.me/{client.username}?start={from_link[1]}"
-            buttons.append(InlineKeyboardButton("🔄 Try Again", url=try_again_link))
+            buttons.append(InlineKeyboardButton("🔄 Try Again", url=f"https://t.me/{client.username}?start={from_link[1]}"))
 
-        # Organize buttons in rows of 1 for better readability
-        buttons_markup = InlineKeyboardMarkup([[button] for button in buttons]) if buttons else None
+        markup = InlineKeyboardMarkup([[b] for b in buttons]) if buttons else None
+        text = f"{client.messages.get('FSUB', 'You must join our channels to use this bot:')}\n\n"
+        photo = client.messages.get('FSUB_PHOTO', '')
 
-        # Edit message with status update and buttons
-        if buttons_markup:
+        try:
+            if photo:
+                await message.reply_photo(photo=photo, caption=text, reply_markup=markup)
+            else:
+                await message.reply(text, reply_markup=markup)
+        except Exception as e:
+            client.LOGGER(__name__, client.name).warning(f"Error sending force sub message: {e}")
             try:
-                await msg.edit_text(text=channels_message, reply_markup=buttons_markup)
-            except Exception as e:
-                client.LOGGER(__name__, client.name).warning(f"Error updating force sub message: {e}")
-                try:
-                    await msg.delete()
-                    await message.reply(text=channels_message, reply_markup=buttons_markup)
-                except Exception:
-                    pass
-        else:
-            await msg.edit_text(text=channels_message)
+                await message.reply(text, reply_markup=markup)
+            except Exception:
+                pass
 
     return wrapper
 
