@@ -1,4 +1,4 @@
-FROM python:3.10
+FROM python:3.11-slim
 WORKDIR /app
 
 # Pehle sirf requirements copy karo taaki Docker cache ka fayda mile
