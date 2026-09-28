@@ -23,7 +23,9 @@ class Bot(Client):
                 "root": "plugins"
             },
             workers=workers,
-            bot_token=token
+            bot_token=token,
+            max_concurrent_transmissions=10,
+            sleep_threshold=60
         )
         self.LOGGER = LOGGER
         self.name = session
@@ -40,6 +42,7 @@ class Bot(Client):
         self.reply_text = messages.get('REPLY', 'Do not send any useless message in the bot.')
         self.mongodb = MongoDB(db_uri, db_name)
         self.req_channels = []
+        self.sub_cache = {}  # user_id -> monotonic time of last successful force-sub check
         self.db_channels = {}  # Initialize DB channels dictionary
         self.primary_db_channel = db  # Set initial primary DB channel
     
@@ -96,6 +99,7 @@ class Bot(Client):
             self.LOGGER(__name__, self.name).warning(f"Error loading dynamic fsub channels: {e}")
             
         await self.mongodb.set_channels(self.req_channels)
+        await self.mongodb.create_indexes()
         
         # Load DB channels from database
         try:
@@ -142,8 +146,6 @@ class Bot(Client):
         try:
             db_channel = await self.get_chat(self.db)
             self.db_channel = db_channel
-            test = await self.send_message(chat_id = db_channel.id, text = "Testing Message by @ProYato")
-            await test.delete()
             
             # Log DB channels info
             self.LOGGER(__name__, self.name).info(f"Primary DB Channel: {self.primary_db_channel}")
@@ -174,4 +176,5 @@ async def web_app():
     await app.setup()
     bind_address = "0.0.0.0"
     await web.TCPSite(app, bind_address, PORT).start()
+
     
