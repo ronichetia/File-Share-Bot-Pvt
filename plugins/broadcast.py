@@ -35,7 +35,7 @@ async def send_text(client, message):
                     await broadcast_msg.copy(chat_id)
                     successful += 1
                 except FloodWait as e:
-                    await asyncio.sleep(e.x)
+                    await asyncio.sleep(e.value)
                     await broadcast_msg.copy(chat_id)
                     successful += 1
                 except UserIsBlocked:
@@ -91,7 +91,7 @@ async def pin_bdcst_text(client, message):
                     # Pin the sent message immediately after broadcasting
                     await client.pin_chat_message(chat_id=chat_id, message_id=sent_msg.id, both_sides=True)
                 except FloodWait as e:
-                    await asyncio.sleep(e.x)
+                    await asyncio.sleep(e.value)
                     # Retry sending and pinning after flood wait
                     sent_msg = await broadcast_msg.copy(chat_id)
                     successful += 1
